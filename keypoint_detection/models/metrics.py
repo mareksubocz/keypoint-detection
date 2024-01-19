@@ -166,6 +166,77 @@ def calculate_ap_from_pr(precision: List[float], recall: List[float]) -> float:
     return ap
 
 
+class KeypointAccMetric(Metric):
+    """torchmetrics-like interface for the Average Precision implementation"""
+
+    full_state_update = False
+
+    def __init__(self, keypoint_threshold_distance: float, dist_sync_on_step=False):
+        """
+
+        Args:
+            keypoint_threshold_distance (float): distance from ground_truth keypoint that is used to classify keypoint as TP or FP.
+        """
+
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+
+        self.keypoint_threshold_distance = keypoint_threshold_distance
+
+        default: Callable = lambda: []
+        self.add_state("classified_keypoints", default=default(), dist_reduce_fx="cat")  # list of ClassifiedKeypoints
+        self.add_state("total_ground_truth_keypoints", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, detected_keypoints: List[DetectedKeypoint], gt_keypoints: List[Keypoint]):
+
+        classified_img_keypoints = keypoint_classification(
+            detected_keypoints, gt_keypoints, self.keypoint_threshold_distance
+        )
+
+        self.classified_keypoints += classified_img_keypoints
+
+        self.total_ground_truth_keypoints += len(gt_keypoints)
+
+    def compute(self):
+        true_positives = sum([1 for kp in self.classified_keypoints if kp.true_positive])
+        false_positives = len(self.classified_keypoints) - true_positives
+        false_negatives = self.total_ground_truth_keypoints - true_positives
+        total = true_positives + false_positives + false_negatives
+
+        if total == 0:
+            return 0
+        accuracy = true_positives / total
+        return accuracy
+
+
+class KeypointAccMetrics(Metric):
+    """
+    Torchmetrics-like interface for calculating average precisions over different keypoint_threshold_distances.
+    Uses KeypointAccMetric class.
+    """
+
+    full_state_update = False
+
+    def __init__(self, keypoint_threshold_distances: List[int], dist_sync_on_step=False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+
+        self.acc_metrics = [KeypointAccMetric(dst, dist_sync_on_step) for dst in keypoint_threshold_distances]
+
+    def update(self, detected_keypoints: List[DetectedKeypoint], gt_keypoints: List[Keypoint]):
+        for metric in self.acc_metrics:
+            metric.update(detected_keypoints, gt_keypoints)
+
+    def compute(self) -> Dict[float, float]:
+        result_dict = {}
+        for metric in self.acc_metrics:
+            result_dict.update({metric.keypoint_threshold_distance: metric.compute()})
+        return result_dict
+
+    def reset(self) -> None:
+        for metric in self.acc_metrics:
+            metric.reset()
+
+
+
 class KeypointAPMetric(Metric):
     """torchmetrics-like interface for the Average Precision implementation"""
 

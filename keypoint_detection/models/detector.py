@@ -5,9 +5,10 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import wandb
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from keypoint_detection.models.backbones.base_backbone import Backbone
-from keypoint_detection.models.metrics import DetectedKeypoint, Keypoint, KeypointAPMetrics
+from keypoint_detection.models.metrics import DetectedKeypoint, Keypoint, KeypointAPMetrics, KeypointAccMetrics
 from keypoint_detection.utils.heatmap import BCE_loss, create_heatmap_batch, get_keypoints_from_heatmap_batch_maxpool
 from keypoint_detection.utils.visualization import (
     get_logging_label_from_channel_configuration,
@@ -134,6 +135,17 @@ class KeypointDetector(pl.LightningModule):
             KeypointAPMetrics(self.maximal_gt_keypoint_pixel_distances) for _ in self.keypoint_channel_configuration
         ]
 
+        self.acc_training_metrics = [
+            KeypointAccMetrics(self.maximal_gt_keypoint_pixel_distances) for _ in self.keypoint_channel_configuration
+        ]
+        self.acc_validation_metrics = [
+            KeypointAccMetrics(self.maximal_gt_keypoint_pixel_distances) for _ in self.keypoint_channel_configuration
+        ]
+
+        self.acc_test_metrics = [
+            KeypointAccMetrics(self.maximal_gt_keypoint_pixel_distances) for _ in self.keypoint_channel_configuration
+        ]
+
         self.n_heatmaps = len(self.keypoint_channel_configuration)
 
         head = nn.Conv2d(
@@ -171,25 +183,27 @@ class KeypointDetector(pl.LightningModule):
 
     def configure_optimizers(self):
         """
-        Configures an Adam optimizer.
+        Configures an Adam optimizer with ReduceLROnPlateau scheduler. To disable the scheduler, set the relative threshold < 0.
         """
         self.optimizer = torch.optim.Adam(self.parameters(), self.learning_rate)
-
-        # TODO: the LR scheduler can reduce training robustness for smaller datasets (where the val loss might fluctuate more),
-        # this makes the impact of a random seed larger. So for now, we disable it.
-        # solution would be to limit the dependency of the scheduler on the dataset size, e.g. by coupling it to the number of model updates instead of epochs.
-
-        # self.lr_scheduler = ReduceLROnPlateau(
-        #     self.optimizer,
-        #     threshold=self.lr_scheduler_relative_threshold,
-        #     threshold_mode="rel",
-        #     mode="min",
-        #     factor=0.1,
-        #     patience=2,
-        #     verbose=True,
-        # )
+        self.lr_scheduler = ReduceLROnPlateau(
+            self.optimizer,
+            threshold=self.lr_scheduler_relative_threshold,
+            threshold_mode="rel",
+            mode="min",
+            factor=0.1,
+            patience=2,
+            verbose=True,
+        )
         return {
             "optimizer": self.optimizer,
+            "lr_scheduler": {
+                "scheduler": self.lr_scheduler,
+                "monitor": "train/loss_epoch",
+                "frequency": 1
+                # If "monitor" references validation metrics, then "frequency" should be set to a
+                # multiple of "trainer.check_val_every_n_epoch".
+            },
         }
 
     def shared_step(self, batch, batch_idx, include_visualization_data_in_result_dict=False) -> Dict[str, Any]:
@@ -254,7 +268,7 @@ class KeypointDetector(pl.LightningModule):
         return result_dict
 
     def training_step(self, train_batch, batch_idx):
-        log_images = batch_idx == 0 and self.current_epoch > 0 and self.is_ap_epoch()
+        log_images = batch_idx == 0 and self.current_epoch > 0
         should_log_ap = self.is_ap_epoch() and batch_idx < 20  # limit AP calculation to first 20 batches to save time
         include_vis_data = log_images or should_log_ap
 
@@ -264,6 +278,7 @@ class KeypointDetector(pl.LightningModule):
 
         if should_log_ap:
             self.update_ap_metrics(result_dict, self.ap_training_metrics)
+            self.update_ap_metrics(result_dict, self.acc_training_metrics)
 
         if log_images:
             image_grids = self.visualize_predictions_channels(result_dict)
@@ -329,6 +344,7 @@ class KeypointDetector(pl.LightningModule):
 
         if self.is_ap_epoch():
             self.update_ap_metrics(result_dict, self.ap_validation_metrics)
+            self.update_ap_metrics(result_dict, self.acc_validation_metrics)
 
             log_images = batch_idx == 0 and self.current_epoch > 0 and self.is_ap_epoch()
             if log_images and isinstance(self.logger, pl.loggers.wandb.WandbLogger):
@@ -346,6 +362,7 @@ class KeypointDetector(pl.LightningModule):
         # no need to switch model to eval mode, this is handled by pytorch lightning
         result_dict = self.shared_step(test_batch, batch_idx, include_visualization_data_in_result_dict=True)
         self.update_ap_metrics(result_dict, self.ap_test_metrics)
+        self.update_ap_metrics(result_dict, self.acc_test_metrics)
         # only log first 10 batches to reduce storage space
         if batch_idx < 10 and isinstance(self.logger, pl.loggers.wandb.WandbLogger):
             image_grids = self.visualize_predictions_channels(result_dict)
@@ -386,6 +403,36 @@ class KeypointDetector(pl.LightningModule):
         self.log(f"{mode}/meanAP", mean_ap)
         self.log(f"{mode}/meanAP/meanAP", mean_ap)
 
+    def log_and_reset_mean_acc(self, mode: str):
+        mean_ap_per_threshold = torch.zeros(len(self.maximal_gt_keypoint_pixel_distances))
+        if mode == "train":
+            metrics = self.acc_training_metrics
+        elif mode == "validation":
+            metrics = self.acc_validation_metrics
+        elif mode == "test":
+            metrics = self.acc_test_metrics
+        else:
+            raise ValueError(f"mode {mode} not recognized")
+
+        # calculate APs for each channel and each threshold distance, and log them
+        print(f" # {mode} metrics:")
+        for channel_idx, channel_name in enumerate(self.keypoint_channel_configuration):
+            channel_aps = self.compute_and_log_acc_metrics_for_channel(metrics[channel_idx], channel_name, mode)
+            mean_ap_per_threshold += torch.tensor(channel_aps)
+
+        # calculate the mAP over all channels for each threshold distance, and log them
+        for i, maximal_distance in enumerate(self.maximal_gt_keypoint_pixel_distances):
+            self.log(
+                f"{mode}/meanAcc/d={float(maximal_distance):.1f}",
+                mean_ap_per_threshold[i] / len(self.keypoint_channel_configuration),
+            )
+
+        # calculate the mAP over all channels and all threshold distances, and log it
+        mean_ap = mean_ap_per_threshold.mean() / len(self.keypoint_channel_configuration)
+        self.log(f"{mode}/meanAcc", mean_ap)
+        self.log(f"{mode}/meanAcc/meanAcc", mean_ap)
+
+
     def training_epoch_end(self, outputs):
         """
         Called on the end of a training epoch.
@@ -393,6 +440,7 @@ class KeypointDetector(pl.LightningModule):
         """
         if self.is_ap_epoch():
             self.log_and_reset_mean_ap("train")
+            self.log_and_reset_mean_acc("train")
 
     def validation_epoch_end(self, outputs):
         """
@@ -401,6 +449,7 @@ class KeypointDetector(pl.LightningModule):
         """
         if self.is_ap_epoch():
             self.log_and_reset_mean_ap("validation")
+            self.log_and_reset_mean_acc("validation")
 
     def test_epoch_end(self, outputs):
         """
@@ -408,6 +457,7 @@ class KeypointDetector(pl.LightningModule):
         Used to compute and log the AP metrics.
         """
         self.log_and_reset_mean_ap("test")
+        self.log_and_reset_mean_acc("test")
 
     def update_channel_ap_metrics(
         self, predicted_heatmaps: torch.Tensor, gt_keypoints: List[torch.Tensor], validation_metric: KeypointAPMetrics
@@ -450,6 +500,26 @@ class KeypointDetector(pl.LightningModule):
 
         metrics.reset()
         return list(ap_metrics.values())
+
+    def compute_and_log_acc_metrics_for_channel(
+        self, metrics: KeypointAccMetrics, channel: str, training_mode: str
+    ) -> List[float]:
+        """
+        logs AP of predictions of single Channel for each threshold distance.
+        Also resets metric and returns resulting AP for all distances.
+        """
+        ap_metrics = metrics.compute()
+        # rounded_ap_metrics = {k: round(v, 3) for k, v in ap_metrics.items()}
+        print(f"{channel} : {ap_metrics}")
+        for maximal_distance, ap in ap_metrics.items():
+            self.log(f"{training_mode}/{channel}_acc/d={float(maximal_distance):.1f}", ap)
+
+        mean_ap = sum(ap_metrics.values()) / len(ap_metrics.values())
+        self.log(f"{training_mode}/{channel}_acc/meanAcc", mean_ap)  # log top level for wandb hyperparam chart.
+
+        metrics.reset()
+        return list(ap_metrics.values())
+
 
     def is_ap_epoch(self) -> bool:
         """Returns True if the AP should be calculated in this epoch."""

@@ -5,10 +5,15 @@ import typing
 from collections import defaultdict
 from pathlib import Path
 from typing import List, Tuple
+from torchvision import transforms
+import numpy as np
+from pprint import pprint
+from copy import deepcopy
 
 import albumentations as A
 import torch
 from torchvision.transforms import ToTensor
+from torchvision.transforms.functional import resize
 
 from keypoint_detection.data.coco_parser import CocoImage, CocoKeypointCategory, CocoKeypoints
 from keypoint_detection.data.imageloader import ImageDataset, ImageLoader
@@ -225,6 +230,41 @@ class COCOKeypointsDataset(ImageDataset):
         unlike e.g. NLP where you directly feed the padded sequences to the network.
         """
         images, keypoints = zip(*data)
+        resized_images = []
+        scaled_keypoints = []
+
+        # Process each image and its keypoints
+        for img_tensor, kp in zip(images, keypoints):
+            if [] in kp:
+                pprint(kp)
+                print('-'*50)
+                print(keypoints)
+                print('*'*50)
+            # Call the resize method
+            resized_img_tensor, scaled_kp = COCOKeypointsDataset.resize_image_and_keypoints(
+                keypoints=kp,  # Convert keypoints to numpy array if not already in that form
+                image_tensor=img_tensor,
+                target_size=(512,512)
+            )
+            resized_images.append(resized_img_tensor)
+            # for i, k in enumerate(scaled_kp):
+            #     if isinstance(k, list):
+            #         if not k:
+            #             scaled_kp[i] = [[-1, -1]]
+            scaled_keypoints.append(
+                    torch.tensor(scaled_kp, dtype=torch.float32)
+                    )  # Convert back to tensor
+
+        # Reorder keypoints to have the different keypoint channels as the first dimension
+        reordered_keypoints = [
+            [scaled_keypoints[i][j] for i in range(len(scaled_keypoints))]
+            for j in range(len(scaled_keypoints[0]))
+        ]
+
+        # Stack the images to create a batch
+        images = torch.stack(resized_images)
+
+        return images, reordered_keypoints
 
         # convert the list of keypoints to a 2D tensor
         keypoints = [[torch.tensor(x) for x in y] for y in keypoints]
@@ -235,3 +275,42 @@ class COCOKeypointsDataset(ImageDataset):
         images = torch.stack(images)
 
         return images, reordered_keypoints
+
+    # @staticmethod
+    # def resize_batch(batch, size):
+    #     from torchvision.transforms.functional import resize
+    #     for i, (image, keypoints) in enumerate(batch):
+    #         original_size = image.shape
+    #         image = resize(image, size)
+    #         keypoints = map(lambda x: (x[0]*size[0]/original_size[0],x[1]*size[1]/original_size[1]), keypoints)
+    #         batch[i] = (image, keypoints)
+    @staticmethod
+    def resize_image_and_keypoints(keypoints, image_tensor, target_size):
+        """
+        Resize an image tensor and scale keypoints accordingly using torchvision's functional API.
+
+        :param keypoints: A list or numpy array of keypoints, shaped as (N, 4, 2) where N is the batch size.
+        :param image_tensor: A PyTorch tensor representing the image, shaped as (C, H, W).
+        :param target_size: A tuple or list with the target dimensions of the image (H, W).
+        :return: A tuple containing the resized image tensor and the scaled keypoints.
+        """
+
+        # Obtain original dimensions from the image tensor
+        _, original_height, original_width = image_tensor.shape
+
+        # Calculate the scale factors for the keypoints
+        height_scale = target_size[0] / original_height
+        width_scale = target_size[1] / original_width
+
+        # Resize image using torchvision's functional API
+        resized_image_tensor = resize(image_tensor, target_size, antialias=True)
+
+        # Scale the keypoints
+        scaled_keypoints = deepcopy(keypoints)
+        for i, batch in enumerate(scaled_keypoints):
+            for j, kp in enumerate(batch):
+                scaled_keypoints[i][j] = [kp[0] * width_scale, kp[1] * height_scale]
+
+        return resized_image_tensor, scaled_keypoints
+
+

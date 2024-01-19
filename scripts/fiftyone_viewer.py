@@ -8,12 +8,17 @@ import numpy as np
 import torch
 import tqdm
 
+from skimage.transform import resize
+from torchvision.transforms.functional import to_tensor
+
 from keypoint_detection.data.coco_dataset import COCOKeypointsDataset
 from keypoint_detection.models.detector import KeypointDetector
 from keypoint_detection.models.metrics import DetectedKeypoint, Keypoint, KeypointAPMetrics
 from keypoint_detection.tasks.train_utils import parse_channel_configuration
 from keypoint_detection.utils.heatmap import compute_keypoint_probability, get_keypoints_from_heatmap_batch_maxpool
-from keypoint_detection.utils.load_checkpoints import get_model_from_wandb_checkpoint
+from keypoint_detection.utils.load_checkpoints import get_model_from_wandb_checkpoint, load_from_checkpoint
+
+from argparse import ArgumentParser
 
 # TODO: can get channel config from the models! no need to specify manually
 # TODO: mAP / image != mAP, maybe it is also not even the best metric to use for ordering samples .Should also log the loss / image.
@@ -79,6 +84,21 @@ class DetectorFiftyoneViewer:
             image_path = str(self.coco_dataset.dataset_dir_path / image_path)
             self.image_path_to_dataset_idx[image_path] = idx
 
+    @staticmethod
+    def resize_keypoints(keypoints, input_size, target_size):
+        """
+        Resize an image tensor and scale keypoints accordingly using torchvision's functional API.
+
+        :param keypoints: A list or numpy array of keypoints, shaped as (N, 4, 2) where N is the batch size.
+        :param image_tensor: A PyTorch tensor representing the image, shaped as (C, H, W).
+        :param target_size: A tuple or list with the target dimensions of the image (H, W).
+        :return: A tuple containing the resized image tensor and the scaled keypoints.
+        """
+        for batch_num in range(len(keypoints)):
+            for i, k in enumerate(keypoints[batch_num]):
+               keypoints[batch_num][i][0] = target_size[1] * k[0] // input_size[1]
+               keypoints[batch_num][i][1] = target_size[0] * k[1] // input_size[0]
+
     def predict_and_compute_metrics(self):
         with torch.no_grad():
             fo_sample_idx = 0
@@ -86,7 +106,14 @@ class DetectorFiftyoneViewer:
                 image_path = fo_sample.filepath
                 image_idx = self.image_path_to_dataset_idx[image_path]
                 image, keypoints = self.coco_dataset[image_idx]
-                image = image.unsqueeze(0)
+
+                image = image.permute(1, 2, 0)
+                original_image_size = image.shape
+                image = resize(image, (1024,1024), anti_aliasing=True)
+                image = (image).astype('float32')
+                image = to_tensor(image).unsqueeze(0).to('cpu')
+
+
                 gt_keypoints = []
                 for channel in keypoints:
                     gt_keypoints.append([[kp[0], kp[1]] for kp in channel])
@@ -99,6 +126,7 @@ class DetectorFiftyoneViewer:
                     predicted_keypoint_probabilities = [
                         compute_keypoint_probability(heatmaps[i], predicted_keypoints[i]) for i in range(len(heatmaps))
                     ]
+                    self.resize_keypoints(predicted_keypoints, (1024, 1024), original_image_size)
                     self.predicted_keypoints[model_name].append(
                         [predicted_keypoints, predicted_keypoint_probabilities]
                     )
@@ -158,7 +186,7 @@ class DetectorFiftyoneViewer:
 
         print(self.fo_dataset)
 
-        session = fo.launch_app(dataset=self.fo_dataset, port=5252)
+        session = fo.launch_app(dataset=self.fo_dataset, port=5151)
         session = self._configure_session_colors(session)
         session.wait()
 
@@ -226,32 +254,56 @@ class DetectorFiftyoneViewer:
 import cv2
 
 cv2.INTER_LINEAR
+
+
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument('dataset_path', type=str)
+    parser.add_argument('checkpoint', type=str)
+    args = parser.parse_args()
+    return args
+
+
 if __name__ == "__main__":
     # TODO: make CLI for this -> hydra config?
-    checkpoint_dict = {
-        # "maxvit-256-flat": "tlips/synthetic-cloth-keypoints-quest-for-precision/model-5ogj44k0:v0",
-        # "maxvit-512-flat": "tlips/synthetic-cloth-keypoints-quest-for-precision/model-1of5e6qs:v0",
-        # "maxvit-pyflex-20k": "tlips/synthetic-cloth-keypoints/model-qiellxgb:v0"
-        # "maxvit-pyflex-512x256": "tlips/synthetic-cloth-keypoints/model-8m3z0wyo:v0",
-        # "maxvit-RTF-512x256" : "tlips/synthetic-cloth-keypoints/model-pzbwimqa:v0",
-        # "maxvit-sim-longer": "tlips/synthetic-cloth-keypoints/model-nvs1pktv:v0",
-        # "rtf-cv2":"tlips/synthetic-cloth-keypoints/model-xvkowjqr:v0",
-        # "rtf-pil":"tlips/synthetic-cloth-keypoints/model-0goi5hc7:v0",
-        # "sim-new-data":"tlips/synthetic-cloth-keypoints/model-axrqhql1:v0",
-        # "sim-40k":"tlips/synthetic-cloth-keypoints/model-yillsdva:v0"
-        # "purple-towel-on-white": "tlips/synthetic-cloth-keypoints-single-towel/model-pw2tsued:v0",
-        "purple-towel-on-white-separate": "tlips/synthetic-cloth-keypoints-single-towel/model-gl39yjtf:v0"
-    }
+    # checkpoint_dict = {
+    #     # "maxvit-256-flat": "tlips/synthetic-cloth-keypoints-quest-for-precision/model-5ogj44k0:v0",
+    #     # "maxvit-512-flat": "tlips/synthetic-cloth-keypoints-quest-for-precision/model-1of5e6qs:v0",
+    #     # "maxvit-pyflex-20k": "tlips/synthetic-cloth-keypoints/model-qiellxgb:v0"
+    #     # "maxvit-pyflex-512x256": "tlips/synthetic-cloth-keypoints/model-8m3z0wyo:v0",
+    #     # "maxvit-RTF-512x256" : "tlips/synthetic-cloth-keypoints/model-pzbwimqa:v0",
+    #     # "maxvit-sim-longer": "tlips/synthetic-cloth-keypoints/model-nvs1pktv:v0",
+    #     # "rtf-cv2":"tlips/synthetic-cloth-keypoints/model-xvkowjqr:v0",
+    #     # "rtf-pil":"tlips/synthetic-cloth-keypoints/model-0goi5hc7:v0",
+    #     # "sim-new-data":"tlips/synthetic-cloth-keypoints/model-axrqhql1:v0",
+    #     # "sim-40k":"tlips/synthetic-cloth-keypoints/model-yillsdva:v0"
+    #     # "purple-towel-on-white": "tlips/synthetic-cloth-keypoints-single-towel/model-pw2tsued:v0",
+    #     "purple-towel-on-white-separate": "tlips/synthetic-cloth-keypoints-single-towel/model-gl39yjtf:v0"
+    # }
+    args = parse_args()
 
-    dataset_path = "/storage/users/tlips/aRTFClothes/towels-test_resized_512x256/towels-test.json"
-    dataset_path = "/home/tlips/Documents/synthetic-cloth-data/synthetic-cloth-data/data/datasets/TOWEL/05-512x256-40k/annotations_val.json"
-    dataset_path = "/home/tlips/Documents/synthetic-cloth-data/synthetic-cloth-data/data/datasets/TOWEL/07-purple-towel-on-white/annotations_val.json"
-    channel_config = "corner0;corner1;corner2;corner3"
+    # dataset_path = "/storage/users/tlips/aRTFClothes/towels-test_resized_512x256/towels-test.json"
+    # dataset_path = "/home/tlips/Documents/synthetic-cloth-data/synthetic-cloth-data/data/datasets/TOWEL/05-512x256-40k/annotations_val.json"
+    # dataset_path = "/home/tlips/Documents/synthetic-cloth-data/synthetic-cloth-data/data/datasets/TOWEL/07-purple-towel-on-white/annotations_val.json"
+    # dataset_path = "/Users/mareksubocz/it/datasets/court_detection_coco/val.json"
+    dataset_path = args.dataset_path
+    # channel_config = "TR= MR= ML= TL"
+    channel_config = "TR: MR: ML: TL"
     detect_only_visible_keypoints = True
-    n_samples = 200
-    models = {key: get_model_from_wandb_checkpoint(value) for key, value in checkpoint_dict.items()}
+    n_samples = 10
+    # models = {key: get_model_from_wandb_checkpoint(value) for key, value in checkpoint_dict.items()}
+    # models = {'latest': load_from_checkpoint("/Users/mareksubocz/it/keypoint-detection/logging/wandb/balltime_court_detection_marek/1qh7aq01/checkpoints/epoch=23-step=312.ckpt")}
+    # models = {'latest': load_from_checkpoint("/Users/mareksubocz/it/keypoint-detection/logging/wandb/balltime_court_detection_marek/3t8fgjmi/checkpoints/epoch=17-step=234.ckpt")}
+    # models = {'latest': get_model_from_wandb_checkpoint("mrksubocz/balltime_court_detection_marek/run-el70dgi0-history:v0")}
+    models = {'latest': load_from_checkpoint(args.checkpoint)}
+    # models = {'latest': load_from_checkpoint("/Users/mareksubocz/it/keypoint-detection/logging/wandb/balltime_court_detection_marek/gje1kalc/checkpoints/epoch=31-step=416.ckpt")}
     visualizer = DetectorFiftyoneViewer(
-        dataset_path, models, channel_config, detect_only_visible_keypoints, n_samples, ap_threshold_distances=[4]
+        dataset_path,
+        models,
+        channel_config,
+        detect_only_visible_keypoints,
+        n_samples,
+        ap_threshold_distances=[30]
     )
     visualizer.predict_and_compute_metrics()
     visualizer.visualize_predictions()
